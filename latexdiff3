@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""latexdiff3 — three-way latexdiff.
+
+Given three revisions of a LaTeX project (BASE -> A -> B, where B builds on A),
+produce a single compiled PDF in which:
+
+  * text present in BASE stays black,
+  * text added between BASE and A is set in one colour  (default Teal),
+  * text added between A and B is set in a second colour (default RoyalBlue),
+  * deletions are struck through in the colour of the revision that removed them.
+
+The classic use: A is a co-author's round, B is your round on top of it, and you
+want to see at a glance who wrote what relative to the last common state.
+
+How it works (see README for details):
+  * The project tree is extracted at each revision (git) or taken from three
+    directories, and the \\input/\\include graph is walked from the main file.
+  * Files changed in only one of the two rounds get a plain two-way latexdiff
+    (BASE vs B), attributed wholly to that round — this avoids all of the
+    artefacts that chained diffs produce.
+  * Files changed in both rounds get a two-stage diff: A vs B is diffed first
+    and its markup renamed to a private namespace (\\ADIFadd...), then BASE is
+    diffed against that marked file; the outer markup (\\DIFadd...) is A's.
+  * The root file's preamble is taken verbatim from B (markup cannot render in
+    a preamble); its body goes through the same per-file logic.
+  * Everything is flattened into one .tex, a colour preamble and a legend are
+    injected, and latexmk compiles it inside a copy of B's tree so that
+    bibliography, figures and classes resolve as usual.
+
+Requires: latexdiff, latexmk (and a TeX distribution), git for --git mode.
+"""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+# ----------------------------------------------------------------------------
+# small helpers
+
+DIF_PREAMBLE_BLOCK = re.compile(
+    r"%DIF PREAMBLE EXTENSION ADDED BY LATEXDIFF.*?"
+    r"%DIF END PREAMBLE EXTENSION ADDED BY LATEXDIFF\n",
+    re.S,
+)
+INPUT_LINE = re.compile(r"^(\s*)\\(?:input|include)\{([^}]+)\}\s*(?:%.*)?$")
+BEGIN_DOC = re.compile(r"\\begin\{document\}")
+END_DOC = re.compile(r"\\end\{document\}")
+
+
+def die(msg: str) -> None:
+    print(f"latexdiff3: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def info(msg: str) -> None:
+    print(f"latexdiff3: {msg}", file=sys.stderr)
+
+
+def resolve_tex(base_dir: Path, name: str) -> Path:
+    """Resolve an \\input{name} the way TeX does (append .tex if missing)."""
+    p = base_dir / name
+    if p.suffix != ".tex" and not p.exists():
+        p = base_dir / (name + ".tex")
+    return p
+
+
+def read(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+# ----------------------------------------------------------------------------
+# extraction
+
+def extract_git(repo: Path, rev: str, dest: Path) -> None:
+    """Extract the full tree of `rev` into dest via git archive."""
+    dest.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(
+        ["git", "-C", str(repo), "archive", rev],
+        capture_output=True, check=False,
+    )
+    if archive.returncode:
+        die(f"git archive {rev} failed: {archive.stderr.decode().strip()}")
+    with tarfile.open(fileobj=__import__("io").BytesIO(archive.stdout)) as tf:
+        tf.extractall(dest)
+
+
+# ----------------------------------------------------------------------------
+# diffing
+
+class Differ:
+    def __init__(self, workdir: Path, diff_args: list[str], scaffolds: list[str]):
+        self.workdir = workdir
+        self.empty = workdir / "empty-preamble.tex"
+        self.empty.write_text("")
+        self.empty_tex = workdir / "empty-file.tex"
+        self.empty_tex.write_text("")
+        self.diff_args = list(diff_args)
+        # Scaffold macros (\todo, \decide, ...) are declared as latexdiff "text
+        # commands": their argument is diffed like prose, so an answered todo is
+        # struck through instead of vanishing into a %DIFDELCMD comment, and the
+        # strike carries the colour of whichever round removed it.
+        if scaffolds:
+            self.diff_args.append("--append-textcmd=" + ",".join(scaffolds))
+        self.n = 0
+
+    def latexdiff(self, old: Path, new: Path) -> str:
+        """Run latexdiff with no injected preamble; return cleaned markup text."""
+        cmd = [
+            "latexdiff", "--type=UNDERLINE", "-p", str(self.empty),
+            *self.diff_args, str(old), str(new),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode:
+            die(f"latexdiff failed on {new.name}:\n{res.stderr.strip()[-2000:]}")
+        return DIF_PREAMBLE_BLOCK.sub("", res.stdout)
+
+    @staticmethod
+    def rename(markup: str) -> str:
+        """Move \\DIF* markup into the private \\ADIF* namespace (round B)."""
+        return markup.replace("\\DIF", "\\ADIF")
+
+    def _tmp(self, tag: str, text: str) -> Path:
+        self.n += 1
+        p = self.workdir / f"frag-{self.n:03d}-{tag}.tex"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def three_way(self, base: Path | None, a: Path | None, b: Path) -> str:
+        """Produce marked-up text for one file across the three revisions.
+
+        base/a may be None when the file did not exist at that revision.
+        b must exist (a file absent from B but still \\input would not compile).
+        """
+        base = base if base and base.exists() else self.empty_tex
+        a = a if a and a.exists() else self.empty_tex
+
+        changed_by_a = not filecmp.cmp(base, a, shallow=False)
+        changed_by_b = not filecmp.cmp(a, b, shallow=False)
+
+        if not changed_by_a and not changed_by_b:
+            return read(b)
+        if changed_by_a and not changed_by_b:
+            # all differences are A's: plain diff, keep \DIF* (colour 1)
+            return self.latexdiff(base, b)
+        if changed_by_b and not changed_by_a:
+            # all differences are B's: plain diff, rename to \ADIF* (colour 2)
+            return self.rename(self.latexdiff(base, b))
+        # both rounds touched the file: two-stage
+        stage1 = self._tmp("stage1", self.rename(self.latexdiff(a, b)))
+        return self.latexdiff(base, stage1)
+
+
+# ----------------------------------------------------------------------------
+# colour preamble + legend
+
+PREAMBLE_TEMPLATE = r"""
+%% ---- latexdiff3 markup definitions ----
+\RequirePackage[normalem]{ulem}
+\providecommand{\DIFadd}[1]{{\protect\color{%(c1)s}#1}}
+\providecommand{\DIFdel}[1]{{\protect\color{%(c1)s}\sout{#1}}}
+\providecommand{\DIFaddbegin}{} \providecommand{\DIFaddend}{}
+\providecommand{\DIFdelbegin}{} \providecommand{\DIFdelend}{}
+\providecommand{\DIFaddFL}[1]{\DIFadd{#1}} \providecommand{\DIFdelFL}[1]{\DIFdel{#1}}
+\providecommand{\DIFaddbeginFL}{} \providecommand{\DIFaddendFL}{}
+\providecommand{\DIFdelbeginFL}{} \providecommand{\DIFdelendFL}{}
+\providecommand{\ADIFadd}[1]{{\protect\color{%(c2)s}#1}}
+\providecommand{\ADIFdel}[1]{{\protect\color{%(c2)s}\sout{#1}}}
+\providecommand{\ADIFaddbegin}{} \providecommand{\ADIFaddend}{}
+\providecommand{\ADIFdelbegin}{} \providecommand{\ADIFdelend}{}
+\providecommand{\ADIFaddFL}[1]{\ADIFadd{#1}} \providecommand{\ADIFdelFL}[1]{\ADIFdel{#1}}
+\providecommand{\ADIFaddbeginFL}{} \providecommand{\ADIFaddendFL}{}
+\providecommand{\ADIFdelbeginFL}{} \providecommand{\ADIFdelendFL}{}
+%% ---- end latexdiff3 definitions ----
+"""
+
+LEGEND_TEMPLATE = r"""
+\noindent\fbox{\parbox{\linewidth}{\textbf{Diff legend:} black = text present in the base revision \textbullet\ {\color{%(c1)s}%(c1)s} = additions by %(l1)s \textbullet\ {\color{%(c2)s}%(c2)s} = additions by %(l2)s \textbullet\ struck-through = deleted by that colour's author.}}\medskip
+"""
+
+
+# ----------------------------------------------------------------------------
+# main pipeline
+
+def flatten(main: Path, src_dir: Path, seen: set[Path] | None = None) -> str:
+    """Inline every top-level \\input/\\include line, recursively."""
+    seen = seen or set()
+    if main in seen:
+        die(f"circular \\input involving {main}")
+    seen.add(main)
+    out = []
+    for line in read(main).splitlines():
+        m = INPUT_LINE.match(line)
+        if m and not line.lstrip().startswith("%"):
+            child = resolve_tex(src_dir, m.group(2))
+            if child.exists():
+                out.append(flatten(child, src_dir, seen))
+            else:
+                out.append(line)  # leave unresolved inputs to TeX
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def collect_inputs(main: Path, src_dir: Path) -> tuple[list[str], list[str]]:
+    """Return (preamble_inputs, body_inputs) referenced from the root file.
+
+    Only the root is split at \\begin{document}; nested inputs inside body
+    files are collected as body inputs.
+    """
+    text = read(main)
+    m = BEGIN_DOC.search(text)
+    split = m.start() if m else 0
+    pre_names, body_names = [], []
+    for match in re.finditer(r"^\s*\\(?:input|include)\{([^}]+)\}", text, re.M):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        if text[line_start:].lstrip().startswith("%"):
+            continue
+        (pre_names if match.start() < split else body_names).append(match.group(1))
+
+    def walk(names: list[str], acc: list[str]) -> None:
+        for name in names:
+            if name in acc:
+                continue
+            acc.append(name)
+            child = resolve_tex(src_dir, name)
+            if child.exists():
+                nested = [
+                    mm.group(1)
+                    for mm in re.finditer(
+                        r"^\s*\\(?:input|include)\{([^}]+)\}", read(child), re.M
+                    )
+                ]
+                walk(nested, acc)
+
+    pre_acc: list[str] = []
+    body_acc: list[str] = []
+    walk(pre_names, pre_acc)
+    walk(body_names, body_acc)
+    return pre_acc, body_acc
+
+
+def split_root(text: str) -> tuple[str, str, str]:
+    """Split a root file into (preamble incl. \\begin{document}, body, tail)."""
+    b = BEGIN_DOC.search(text)
+    e = END_DOC.search(text)
+    if not b or not e:
+        die("main file has no \\begin{document}/\\end{document}")
+    return text[: b.end()], text[b.end() : e.start()], text[e.start() :]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="latexdiff3",
+        description="Three-way latexdiff: base in black, round A in one colour, round B in another.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--git", nargs=3, metavar=("BASE", "A", "B"),
+                      help="three git revisions (run inside the repo, or use --repo)")
+    mode.add_argument("--dirs", nargs=3, metavar=("BASE", "A", "B"),
+                      help="three directories each containing the project tree")
+    ap.add_argument("--repo", default=".", help="git repository root (with --git)")
+    ap.add_argument("--main", required=True,
+                    help="path of the main .tex file relative to the tree root")
+    ap.add_argument("--label1", default="round A", help="legend label for BASE->A additions")
+    ap.add_argument("--label2", default="round B", help="legend label for A->B additions")
+    ap.add_argument("--color1", default="Teal", help="xcolor name for round A")
+    ap.add_argument("--color2", default="RoyalBlue", help="xcolor name for round B")
+    ap.add_argument("--no-legend", action="store_true", help="skip the legend box after \\maketitle")
+    ap.add_argument("--no-pdf", action="store_true", help="stop after writing the merged .tex")
+    ap.add_argument("--open", action="store_true", help="open the PDF when done (macOS)")
+    ap.add_argument("--keep", action="store_true", help="keep the temporary work directory")
+    ap.add_argument("--scaffold", action="append", default=None, metavar="CMD",
+                    help="macro whose argument is scaffold text (todo notes, decision "
+                         "markers): an answered/removed one is struck through in the "
+                         "remover's colour instead of disappearing. Repeatable; "
+                         "default: todo, decide. Pass --no-scaffold to disable.")
+    ap.add_argument("--no-scaffold", action="store_true",
+                    help="disable scaffold handling entirely")
+    ap.add_argument("--latexdiff-arg", action="append", default=[], metavar="ARG",
+                    help="extra argument passed through to every latexdiff call (repeatable)")
+    ap.add_argument("-o", "--output", default=None,
+                    help="output PDF path (default: <main>-diff3.pdf in the current directory)")
+    args = ap.parse_args()
+
+    for tool in ("latexdiff", "latexmk"):
+        if not shutil.which(tool):
+            die(f"'{tool}' not found on PATH")
+
+    workdir = Path(tempfile.mkdtemp(prefix="latexdiff3-"))
+    trees = {name: workdir / name for name in ("base", "a", "b")}
+    try:
+        # -- extract the three trees ---------------------------------------
+        if args.git:
+            repo = Path(args.repo).resolve()
+            for rev, name in zip(args.git, ("base", "a", "b")):
+                extract_git(repo, rev, trees[name])
+        else:
+            for src, name in zip(args.dirs, ("base", "a", "b")):
+                src = Path(src).resolve()
+                if not src.is_dir():
+                    die(f"not a directory: {src}")
+                shutil.copytree(src, trees[name], dirs_exist_ok=True)
+
+        main_rel = Path(args.main)
+        for name in ("base", "a", "b"):
+            if not (trees[name] / main_rel).exists() and name == "b":
+                die(f"main file {main_rel} not found in revision B")
+
+        src_b = (trees["b"] / main_rel).parent
+        src_a = (trees["a"] / main_rel).parent
+        src_base = (trees["base"] / main_rel).parent
+
+        scaffolds = [] if args.no_scaffold else (args.scaffold or ["todo", "decide"])
+        differ = Differ(workdir, args.latexdiff_arg, scaffolds)
+
+        # -- classify the input graph --------------------------------------
+        pre_inputs, body_inputs = collect_inputs(trees["b"] / main_rel, src_b)
+        stitched = workdir / "stitched"
+        stitched.mkdir()
+
+        for name in pre_inputs:
+            # preamble material cannot carry markup: take revision B verbatim
+            child = resolve_tex(src_b, name)
+            if child.exists():
+                dest = stitched / child.relative_to(src_b)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, dest)
+                info(f"preamble file taken from B unchanged: {child.name}")
+
+        for name in body_inputs:
+            b_file = resolve_tex(src_b, name)
+            if not b_file.exists():
+                continue
+            rel = b_file.relative_to(src_b)
+            dest = stitched / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(
+                differ.three_way(src_base / rel, src_a / rel, b_file),
+                encoding="utf-8",
+            )
+
+        # -- the root file: preamble from B, body diffed -------------------
+        def body_of(tree_dir: Path, tag: str) -> Path | None:
+            f = tree_dir / main_rel
+            if not f.exists():
+                return None
+            _, body, _ = split_root(read(f))
+            return differ._tmp(f"rootbody-{tag}", body)
+
+        pre_b, _, tail_b = split_root(read(trees["b"] / main_rel))
+        body_markup = differ.three_way(
+            body_of(trees["base"], "base"), body_of(trees["a"], "a"),
+            body_of(trees["b"], "b"),
+        )
+        colours = {"c1": args.color1, "c2": args.color2,
+                   "l1": args.label1, "l2": args.label2}
+        root = pre_b
+        root = root.replace(
+            "\\begin{document}",
+            PREAMBLE_TEMPLATE % colours + "\n\\begin{document}", 1,
+        )
+        if not args.no_legend:
+            legend = LEGEND_TEMPLATE % colours
+            if "\\maketitle" in body_markup:
+                body_markup = body_markup.replace("\\maketitle", "\\maketitle\n" + legend, 1)
+            else:
+                body_markup = legend + body_markup
+        root_out = stitched / main_rel.name
+        root_out.write_text(root + body_markup + tail_b, encoding="utf-8")
+
+        # -- flatten and compile inside B's tree ---------------------------
+        merged = flatten(root_out, stitched)
+        build_dir = src_b
+        out_stem = main_rel.stem + "-diff3"
+        merged_tex = build_dir / (out_stem + ".tex")
+        merged_tex.write_text(merged, encoding="utf-8")
+
+        if args.no_pdf:
+            final_tex = Path.cwd() / (out_stem + ".tex")
+            shutil.copy2(merged_tex, final_tex)
+            info(f"wrote {final_tex}")
+            return
+
+        info("compiling with latexmk ...")
+        res = subprocess.run(
+            ["latexmk", "-pdf", "-interaction=nonstopmode", "-halt-on-error",
+             merged_tex.name],
+            cwd=build_dir, capture_output=True, text=True,
+        )
+        pdf = build_dir / (out_stem + ".pdf")
+        if res.returncode or not pdf.exists():
+            log = build_dir / (out_stem + ".log")
+            excerpt = ""
+            if log.exists():
+                lines = read(log).splitlines()
+                marks = [i for i, l in enumerate(lines) if l.startswith("!")]
+                if marks:
+                    i = marks[0]
+                    excerpt = "\n".join(lines[i : i + 6])
+            die(f"latexmk failed.\n{excerpt}\nfull log: {log}")
+
+        out_pdf = Path(args.output) if args.output else Path.cwd() / (out_stem + ".pdf")
+        shutil.copy2(pdf, out_pdf)
+        info(f"wrote {out_pdf}")
+        if args.open and sys.platform == "darwin":
+            subprocess.run(["open", str(out_pdf)])
+    finally:
+        if args.keep:
+            info(f"work directory kept at {workdir}")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
