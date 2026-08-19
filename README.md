@@ -62,6 +62,10 @@ ln -s "$(pwd)/tex-blame" ~/.local/bin/tex-blame
 | `--latexdiff-arg ARG` | pass an extra argument to every `latexdiff` call |
 | `-o PATH` | output PDF path (default `<main>-blame.pdf`) |
 
+## Colours
+
+Auto-selection assigns each author the next colour from the default palette, in this order: `texblameBlue`, `texblameGreen`, `texblameRed`, `texblameOrange`, `texblamePurple`, `texblameBrown`, `texblamePink`, `texblamePaleOrange`, `texblamePalePurple`, `texblamePaleBlue`, `texblamePaleGreen`, `texblamePaleYellow` — the 12-class qualitative *Paired* scheme from [ColorBrewer](https://colorbrewer2.org/#type=qualitative&scheme=Paired&n=12), colours © Cynthia Brewer, Mark Harrower and The Pennsylvania State University. Override per round with `--colors` (built-in names or any colour the document defines).
+
 ## Scaffold macros: seeing who answered a TODO
 
 Papers often carry scaffold markers — `\todo{...}`, `\decide{...}` — that a later round *answers* by deleting the marker and writing real prose. Plain `latexdiff` hides a deleted macro call inside an invisible `%DIFDELCMD` comment, so answered todos silently disappear from a diff.

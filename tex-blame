@@ -81,17 +81,23 @@ END_DOC = re.compile(r"\\end\{document\}")
 
 # default palette: our own colour definitions (rgb), independent of xcolor's
 # dvipsnames option so any document that loads color/xcolor can render them
-# ordered for maximum pairwise separability (blue/orange first: the classic
-# colour-blind-safe pair)
+# default palette: the 12-class qualitative "Paired" scheme from ColorBrewer,
+# reordered dark-first — colours from https://colorbrewer2.org
+# (© Cynthia Brewer, Mark Harrower and The Pennsylvania State University,
+# Apache-2.0-style licence). Auto-selection walks this list in order.
 PALETTE = [
-    ("texblameBlue", "0.15,0.35,0.85"),
-    ("texblameOrange", "0.85,0.42,0.00"),
-    ("texblameViolet", "0.55,0.20,0.70"),
-    ("texblameTeal", "0.00,0.45,0.45"),
-    ("texblameBrick", "0.70,0.15,0.15"),
-    ("texblameOlive", "0.40,0.50,0.10"),
-    ("texblameMagenta", "0.80,0.00,0.60"),
-    ("texblameBrown", "0.50,0.35,0.20"),
+    ("texblameBlue", "1F78B4"),
+    ("texblameGreen", "33A02C"),
+    ("texblameRed", "E31A1C"),
+    ("texblameOrange", "FF7F00"),
+    ("texblamePurple", "6A3D9A"),
+    ("texblameBrown", "B15928"),
+    ("texblamePink", "FB9A99"),
+    ("texblamePaleOrange", "FDBF6F"),
+    ("texblamePalePurple", "CAB2D6"),
+    ("texblamePaleBlue", "A6CEE3"),
+    ("texblamePaleGreen", "B2DF8A"),
+    ("texblamePaleYellow", "FFFF99"),
 ]
 NS_LETTERS = string.ascii_uppercase  # per-round markup namespaces, max 26 rounds
 
@@ -106,8 +112,8 @@ def info(msg: str) -> None:
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    res = subprocess.run(["git", "-C", str(repo), *args],
-                         capture_output=True, text=True)
+    res = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                         text=True, encoding="utf-8", errors="replace")
     if check and res.returncode:
         die(f"git {' '.join(args[:2])} failed: {res.stderr.strip()}")
     return res
@@ -186,7 +192,7 @@ class Round:
 
 
 def build_git_chain(args, repo: Path):
-    """Return (revs, rounds) for the three git modes."""
+    """Return (revs, labels, authors) for the three git modes."""
     if args.git:
         if len(args.git) < 2:
             die("--git needs a BASE and at least one later revision")
@@ -241,10 +247,13 @@ def assign_colors(labels: list, authors: list | None, override: str | None):
     colors = []
     for k in keys:
         if k not in mapping:
-            name, rgb = PALETTE[len(mapping) % len(PALETTE)]
+            if len(mapping) == len(PALETTE):
+                info(f"warning: more than {len(PALETTE)} distinct authors; "
+                     "palette colours will repeat")
+            name, hexval = PALETTE[len(mapping) % len(PALETTE)]
             mapping[k] = name
             if not any(d[0] == name for d in defs):
-                defs.append((name, rgb))
+                defs.append((name, hexval))
         colors.append(mapping[k])
     return colors, defs
 
@@ -353,6 +362,9 @@ class Differ:
                 elif c == "}":
                     depth -= 1
                 j += 1
+            if depth:  # unbalanced braces: leave the remainder untouched
+                out.append(text[i:])
+                return "".join(out)
             content = text[m.end(): j - 1]
             out.append(text[i: m.end()])
             author = None
@@ -392,13 +404,14 @@ def markup_preamble(rounds: list, color_defs: list, tags: bool = True) -> str:
            "\\RequirePackage[normalem]{ulem}",
            "\\makeatletter\\@ifpackageloaded{xcolor}{}{"
            "\\RequirePackage{xcolor}}\\makeatother"]
-    for name, rgb in color_defs:
-        out.append(f"\\definecolor{{{name}}}{{rgb}}{{{rgb}}}")
+    for name, hexval in color_defs:
+        out.append(f"\\definecolor{{{name}}}{{HTML}}{{{hexval}}}")
     if tags:
         # tag once per author-run per paragraph: the para/begin hook resets
         # the tracker so every paragraph names its contributors afresh
         out.append("\\gdef\\tbBlameLast{0}")
-        out.append("\\AddToHook{para/begin}{\\gdef\\tbBlameLast{0}}")
+        out.append("\\ifdefined\\AddToHook"
+                   "\\AddToHook{para/begin}{\\gdef\\tbBlameLast{0}}\\fi")
         tag_ids = {}
         for r in rounds:
             tag_ids.setdefault(r.label, len(tag_ids) + 1)
@@ -453,8 +466,8 @@ def legend(rounds: list, base_label: str) -> str:
     for r in rounds:
         if (r.label, r.color) not in seen:
             seen.append((r.label, r.color))
-    parts = [f"black = {base_label}"]
-    parts += [f"{{\\color{{{c}}}{l}}}" for l, c in seen]
+    parts = [f"black = {tex_escape(base_label)}"]
+    parts += [f"{{\\color{{{c}}}{tex_escape(l)}}}" for l, c in seen]
     joined = " \\textbullet\\ ".join(parts)
     return ("\n\\noindent\\fbox{\\parbox{\\linewidth}{\\textbf{tex-blame:} "
             + joined
@@ -673,7 +686,11 @@ def main() -> None:
                  else final_tree / main_rel)
             if not f or not f.exists():
                 return None
-            _, body, _ = split_root(read(f))
+            text = read(f)
+            if not (BEGIN_DOC.search(text) and END_DOC.search(text)):
+                # an early revision without a document body: treat as absent
+                return None
+            _, body, _ = split_root(text)
             return differ.tmp(f"rootbody{i}", body)
 
         pre_final, _, tail_final = split_root(read(final_tree / main_rel))
@@ -694,6 +711,13 @@ def main() -> None:
 
         # -- flatten and compile -------------------------------------------
         merged = flatten(root_out, stitched)
+        for name in body_inputs:
+            # an \input the flattener could not inline compiles from the plain
+            # (uncoloured) file in the newest tree — say so instead of failing
+            if re.search(r"^[^%\n]*\\(?:input|include)\{" + re.escape(name) + r"\}",
+                         merged, re.M):
+                info(f"warning: could not inline \\input{{{name}}}; "
+                     f"it will render unattributed (black)")
         out_stem = main_rel.stem + "-blame"
         merged_tex = src_final / (out_stem + ".tex")
         merged_tex.write_text(merged, encoding="utf-8")
