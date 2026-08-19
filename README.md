@@ -73,13 +73,14 @@ Papers often carry scaffold markers — `\todo{...}`, `\decide{...}` — that a 
 2. **Per-file attribution.** A file changed by only one round gets a plain two-way diff (base vs newest) attributed wholly to that round — chained diffs are avoided wherever possible, because chaining is what produces artefacts.
 3. A file changed by **several** rounds gets a chained diff, newest round first: each stage's `latexdiff` markup is immediately renamed into that round's private macro namespace (`\ATBDIFadd`, `\BTBDIFadd`, ...), so earlier stages see it as opaque tokens and attribution cannot leak between rounds.
 4. Files `\input` in the **preamble** are taken verbatim from the newest revision (markup cannot render before `\begin{document}`); the root file's preamble likewise, with only its body diffed.
-5. Raw-content environments (`CCSXML`, `verbatim`, `lstlisting`, `tikzpicture`, `filecontents`) are treated as opaque blocks that swap wholesale rather than being marked up word-by-word.
-6. Everything is flattened into one `.tex`, per-round colour definitions and a legend are injected, and `latexmk` compiles it inside a copy of the newest tree so the bibliography, figures, and document class resolve normally.
+5. **Deleted-text archaeology.** latexdiff colours a deletion only by its deleter; to also show the *author*, every deletion span (always plain old-side text) is searched for in the earlier revisions of the file — whitespace-insensitively, since latexdiff does not preserve exact spacing — and wrapped in a colour-only command for the earliest revision that contains it. The result: deleted text renders dimmed in its author's colour with the strike line in the deleter's colour. Spans shorter than 12 characters stay unattributed (grey) to avoid false matches.
+6. Raw-content environments (`CCSXML`, `verbatim`, `lstlisting`, `tikzpicture`, `filecontents`) are treated as opaque blocks that swap wholesale rather than being marked up word-by-word.
+7. Everything is flattened into one `.tex`, per-round colour definitions and a legend are injected, and `latexmk` compiles it inside a copy of the newest tree so the bibliography, figures, and document class resolve normally.
 
 ## Limitations
 
 - The chain must be linear: each revision must contain the previous one's changes. For git histories the first-parent path is used; content merged in via PRs is attributed to the round that brought it onto the first-parent line.
-- A passage rewritten by **several** rounds can render noisily (the same original text struck once per round). Attribution of the surviving text stays correct.
+- A passage rewritten by **several** rounds can render noisily (the same original text struck once per round). Attribution of the surviving text stays correct; deleted-text author attribution is heuristic (whitespace-insensitive substring matching) and falls back to grey when a span cannot be found in an earlier revision.
 - The bibliography compiles from the newest `.bib`; `.bib` changes are not marked up.
 - The root file must contain `\begin{document}` and `\end{document}` directly (not via `\input`).
 - At most 26 rounds (one markup namespace letter per round); author squashing keeps real histories well under this.

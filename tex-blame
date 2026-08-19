@@ -67,6 +67,15 @@ DIF_PREAMBLE_BLOCK = re.compile(
     re.S,
 )
 INPUT_LINE = re.compile(r"^(\s*)\\(?:input|include)\{([^}]+)\}\s*(?:%.*)?$")
+# an \input line may carry our zero-width blame markers (this happens when a
+# revision renamed section files, so latexdiff marks the \input lines
+# added/deleted); the markers are argument-less and can be split onto their
+# own lines so the \input itself can still be inlined
+MARKED_INPUT_LINE = re.compile(
+    r"^(\s*(?:\\[A-Z]TBDIF(?:add|del)(?:begin|end)(?:FL)?\s+)*)"
+    r"\\(?:input|include)\{([^}]+)\}\s*"
+    r"((?:\\[A-Z]TBDIF(?:add|del)(?:begin|end)(?:FL)?\s*)*)(?:%.*)?$"
+)
 BEGIN_DOC = re.compile(r"\\begin\{document\}")
 END_DOC = re.compile(r"\\end\{document\}")
 
@@ -221,7 +230,9 @@ def assign_colors(labels: list, authors: list | None, override: str | None):
         names = override.split(",")
         if len(names) < len(labels):
             die(f"--colors gives {len(names)} colours for {len(labels)} rounds")
-        return names[: len(labels)], []
+        # built-in palette names used in the override still need their definitions
+        defs = [d for d in PALETTE if d[0] in names]
+        return names[: len(labels)], defs
     keys = authors if authors else labels
     mapping: dict = {}
     defs = []
@@ -294,7 +305,8 @@ class Differ:
             return read(eff[-1])
         if len(changed) == 1:
             k = changed[0]
-            return rounds[k - 1].rename(self.latexdiff(eff[0], eff[-1]))
+            marked = rounds[k - 1].rename(self.latexdiff(eff[0], eff[-1]))
+            return self.attribute_deleted(marked, eff, rounds)
         # several rounds touched the file: chain the diffs newest-first, moving
         # each stage's markup into its round's namespace so earlier stages see
         # it as opaque tokens
@@ -302,7 +314,58 @@ class Differ:
         for k in reversed(changed):
             marked = rounds[k - 1].rename(self.latexdiff(eff[k - 1], cur))
             cur = self.tmp(f"stage{k}", marked)
-        return read(cur)
+        return self.attribute_deleted(read(cur), eff, rounds)
+
+    DEL_SPAN = re.compile(r"\\([A-Z])TBDIFdel(?:FL)?\{")
+
+    @staticmethod
+    def _normalize(s: str) -> str:
+        # strip ALL whitespace: latexdiff's reconstruction of deleted text does
+        # not preserve exact spacing ("remote substitutes" -> "remotesubstitutes")
+        return re.sub(r"\s+", "", s)
+
+    def attribute_deleted(self, text: str, eff: list, rounds: list) -> str:
+        """Colour deleted text by its AUTHOR, not its deleter.
+
+        latexdiff never nests a deletion inside the author's add-markup, so a
+        deleted span inherits black by default. Its content is always plain
+        old-side prose, though — so we look for the earliest revision of the
+        file that contains those words and wrap the span in that round's
+        colour-only \\...TBDIFtxt command (base text stays unwrapped/grey).
+        A minimum length guards against false matches on short spans.
+        """
+        norms = [self._normalize(read(f)) for f in eff[:-1]]
+        out, i = [], 0
+        while True:
+            m = self.DEL_SPAN.search(text, i)
+            if not m:
+                out.append(text[i:])
+                return "".join(out)
+            depth, j = 1, m.end()
+            while j < len(text) and depth:
+                c = text[j]
+                if c == "\\":
+                    j += 1
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                j += 1
+            content = text[m.end(): j - 1]
+            out.append(text[i: m.end()])
+            author = None
+            probe = self._normalize(content)
+            if len(probe) >= 12:
+                for idx, filenorm in enumerate(norms):
+                    if probe in filenorm:
+                        author = rounds[idx - 1] if idx > 0 else None
+                        break
+            if author is not None:
+                out.append(f"\\{author.ns}TBDIFtxt{{{content}}}")
+            else:
+                out.append(content)
+            out.append("}")
+            i = j
 
 
 # ----------------------------------------------------------------------------
@@ -331,6 +394,9 @@ def markup_preamble(rounds: list, color_defs: list) -> str:
             f"\\bgroup\\markoverwith{{\\textcolor{{{c}}}"
             f"{{\\rule[0.5ex]{{2pt}}{{0.4pt}}}}}}"
             f"\\ULon{{{{\\protect\\color{{.!65}}#1}}}}}}}}",
+            # colour-only wrapper used inside deletion spans: dimmed AUTHOR
+            # colour for text this round wrote that a later round deleted
+            f"\\DeclareRobustCommand{{{p}txt}}[1]{{{{\\protect\\color{{{c}!65}}#1}}}}",
             f"\\providecommand{{{p}addbegin}}{{}} \\providecommand{{{p}addend}}{{}}",
             f"\\providecommand{{{p}delbegin}}{{}} \\providecommand{{{p}delend}}{{}}",
             f"\\providecommand{{{p}addFL}}[1]{{{p}add{{#1}}}}"
@@ -398,10 +464,18 @@ def flatten(main: Path, src_dir: Path, seen=None) -> str:
     seen.add(main)
     out = []
     for line in read(main).splitlines():
-        m = INPUT_LINE.match(line)
+        m = MARKED_INPUT_LINE.match(line)
         if m and not line.lstrip().startswith("%"):
             child = src_dir / resolve_name(m.group(2))
-            out.append(flatten(child, src_dir, seen) if child.exists() else line)
+            if child.exists():
+                pre, post = m.group(1).strip(), m.group(3).strip()
+                if pre:
+                    out.append(pre)
+                out.append(flatten(child, src_dir, seen))
+                if post:
+                    out.append(post)
+            else:
+                out.append(line)
         else:
             out.append(line)
     return "\n".join(out)
