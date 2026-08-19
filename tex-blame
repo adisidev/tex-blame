@@ -375,7 +375,9 @@ class Differ:
                         author = rounds[idx - 1] if idx > 0 else None
                         break
             if author is not None:
-                out.append(f"\\{author.ns}TBDIFtxt{{{content}}}")
+                # a colour switch, not a braced wrapper — braces would make
+                # the span a single unbreakable box under ulem
+                out.append(f"\\{author.ns}TBDIFtxt " + content)
             else:
                 out.append(content)
             out.append("}")
@@ -403,7 +405,10 @@ def markup_preamble(rounds: list, color_defs: list, tags: bool = True) -> str:
     out = ["%% ---- tex-blame markup definitions ----",
            "\\RequirePackage[normalem]{ulem}",
            "\\makeatletter\\@ifpackageloaded{xcolor}{}{"
-           "\\RequirePackage{xcolor}}\\makeatother"]
+           "\\RequirePackage{xcolor}}\\makeatother",
+           # words under ulem markup are boxed and cannot hyphenate; give the
+           # paragraph builder slack so they wrap instead of overrunning
+           "\\setlength{\\emergencystretch}{3em}"]
     for name, hexval in color_defs:
         out.append(f"\\definecolor{{{name}}}{{HTML}}{{{hexval}}}")
     if tags:
@@ -422,13 +427,19 @@ def markup_preamble(rounds: list, color_defs: list, tags: bool = True) -> str:
             # robust: these appear inside section titles and other moving
             # arguments, where an expanded ulem construct loops
             f"\\DeclareRobustCommand{{{p}add}}[1]{{{{\\protect\\color{{{c}}}#1}}}}",
+            # the dim colour sits OUTSIDE \ULon and the argument is passed
+            # bare: ulem can only break lines at spaces it sees at the outer
+            # brace level, so any extra group around #1 would turn the whole
+            # span into one unbreakable box that overruns the margin
             f"\\DeclareRobustCommand{{{p}del}}[1]{{{{"
+            f"\\protect\\color{{.!65}}"
             f"\\bgroup\\markoverwith{{\\textcolor{{{c}}}"
             f"{{\\rule[0.5ex]{{2pt}}{{0.4pt}}}}}}"
-            f"\\ULon{{{{\\protect\\color{{.!65}}#1}}}}}}}}",
-            # colour-only wrapper used inside deletion spans: dimmed AUTHOR
-            # colour for text this round wrote that a later round deleted
-            f"\\DeclareRobustCommand{{{p}txt}}[1]{{{{\\protect\\color{{{c}!65}}#1}}}}",
+            f"\\ULon{{#1}}}}}}",
+            # brace-free colour SWITCH used inside deletion spans: dimmed
+            # AUTHOR colour for text this round wrote that a later round
+            # deleted (a braced wrapper would again block line breaking)
+            f"\\DeclareRobustCommand{{{p}txt}}{{\\protect\\color{{{c}!65}}}}",
         ]
         if tags:
             # a change-region begin marker becomes a tiny subscripted author
