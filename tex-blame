@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""tex-blame — git blame for LaTeX papers, rendered as a compiled PDF.
+
+Given a chain of revisions of a LaTeX project (a base plus one or more rounds
+of edits), tex-blame compiles a single PDF in which:
+
+  * text present in the base revision stays black,
+  * text added by each round is set in that round's colour (in the git modes,
+    rounds are grouped by commit author, so each author gets a colour),
+  * deletions are struck through in the colour of the round that removed them,
+  * scaffold macros (\\todo, \\decide, ...) that a round answered are struck
+    through in the answerer's colour instead of silently disappearing.
+
+Modes:
+  --git BASE R1 [R2 ...]   explicit chain of git revisions (BASE shown black)
+  --since BASE             blame every commit after BASE (first-parent chain,
+                           consecutive commits by one author squashed into one
+                           round); BASE and before shown black
+  --all                    blame the whole history: the base is the empty tree,
+                           so every word is attributed to an author
+  --dirs D0 D1 [D2 ...]    explicit chain of directories (no git needed)
+
+The chain must be linear: each revision is assumed to contain the previous
+one's changes (in git terms, the first-parent path).
+
+How it works (see README for details): files changed by only one round get a
+plain two-way diff attributed wholly to that round; files changed by several
+rounds get a chained diff, newest round first, with each stage's markup moved
+into a private per-round namespace so attribution cannot leak. Preamble
+material is taken verbatim from the newest revision, everything is flattened
+into one .tex, and latexmk compiles it inside the newest tree.
+
+Requires: latexdiff, latexmk (and a TeX distribution), git for the git modes.
+
+Copyright (C) 2026 adisidev
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the GNU General Public License for more details:
+<https://www.gnu.org/licenses/gpl-3.0.html>.
+"""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import io
+import re
+import shutil
+import string
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path, PurePosixPath
+
+# ----------------------------------------------------------------------------
+# small helpers
+
+DIF_PREAMBLE_BLOCK = re.compile(
+    r"%DIF PREAMBLE EXTENSION ADDED BY LATEXDIFF.*?"
+    r"%DIF END PREAMBLE EXTENSION ADDED BY LATEXDIFF\n",
+    re.S,
+)
+INPUT_LINE = re.compile(r"^(\s*)\\(?:input|include)\{([^}]+)\}\s*(?:%.*)?$")
+BEGIN_DOC = re.compile(r"\\begin\{document\}")
+END_DOC = re.compile(r"\\end\{document\}")
+
+# default palette: our own colour definitions (rgb), independent of xcolor's
+# dvipsnames option so any document that loads color/xcolor can render them
+PALETTE = [
+    ("texblameTeal", "0.00,0.45,0.45"),
+    ("texblameBlue", "0.20,0.35,0.80"),
+    ("texblameBrick", "0.70,0.15,0.15"),
+    ("texblameOrange", "0.80,0.40,0.00"),
+    ("texblameViolet", "0.55,0.20,0.70"),
+    ("texblameOlive", "0.40,0.50,0.10"),
+    ("texblameMagenta", "0.80,0.00,0.60"),
+    ("texblameBrown", "0.50,0.35,0.20"),
+]
+NS_LETTERS = string.ascii_uppercase  # per-round markup namespaces, max 26 rounds
+
+
+def die(msg: str) -> None:
+    print(f"tex-blame: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def info(msg: str) -> None:
+    print(f"tex-blame: {msg}", file=sys.stderr)
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    res = subprocess.run(["git", "-C", str(repo), *args],
+                         capture_output=True, text=True)
+    if check and res.returncode:
+        die(f"git {' '.join(args[:2])} failed: {res.stderr.strip()}")
+    return res
+
+
+def read(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def resolve_name(name: str) -> str:
+    return name if name.endswith(".tex") else name + ".tex"
+
+
+# ----------------------------------------------------------------------------
+# sources: provide any project file at any point of the chain
+
+class GitSource:
+    """Chain point 0 is the base (possibly the empty tree, rev=None)."""
+
+    def __init__(self, repo: Path, revs: list, workdir: Path):
+        self.repo = repo
+        self.revs = revs  # element 0 may be None (empty tree)
+        self.workdir = workdir
+
+    def file_at(self, i: int, rel: PurePosixPath) -> Path | None:
+        rev = self.revs[i]
+        if rev is None:
+            return None
+        cache = self.workdir / f"rev{i}" / rel
+        if cache.exists():
+            return cache
+        res = git(self.repo, "show", f"{rev}:{rel}", check=False)
+        if res.returncode:
+            return None
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(res.stdout, encoding="utf-8")
+        return cache
+
+    def extract_final(self, dest: Path) -> None:
+        res = subprocess.run(
+            ["git", "-C", str(self.repo), "archive", self.revs[-1]],
+            capture_output=True,
+        )
+        if res.returncode:
+            die(f"git archive {self.revs[-1]} failed: {res.stderr.decode().strip()}")
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(res.stdout)) as tf:
+            tf.extractall(dest)
+
+
+class DirSource:
+    def __init__(self, dirs: list):
+        self.dirs = [Path(d).resolve() for d in dirs]
+
+    def file_at(self, i: int, rel: PurePosixPath) -> Path | None:
+        p = self.dirs[i] / rel
+        return p if p.exists() else None
+
+    def extract_final(self, dest: Path) -> None:
+        shutil.copytree(self.dirs[-1], dest, dirs_exist_ok=True)
+
+
+# ----------------------------------------------------------------------------
+# rounds
+
+class Round:
+    def __init__(self, idx: int, label: str, color: str):
+        self.idx = idx          # 1-based position in the chain
+        self.label = label
+        self.color = color
+        self.ns = NS_LETTERS[idx - 1]  # markup namespace letter
+
+    def rename(self, markup: str) -> str:
+        """Move fresh \\DIF* markup into this round's private namespace."""
+        return markup.replace("\\DIF", f"\\{self.ns}TBDIF")
+
+
+def build_git_chain(args, repo: Path):
+    """Return (revs, rounds) for the three git modes."""
+    if args.git:
+        if len(args.git) < 2:
+            die("--git needs a BASE and at least one later revision")
+        revs = list(args.git)
+        labels = args.labels.split(",") if args.labels else [
+            f"round {i}" for i in range(1, len(revs))
+        ]
+        return revs, labels, None
+
+    head = args.head
+    if args.since:
+        base = args.since
+        rev_range = f"{base}..{head}"
+    else:  # --all
+        base = None
+        rev_range = head
+    res = git(repo, "rev-list", "--first-parent", "--reverse", rev_range)
+    commits = res.stdout.split()
+    if not commits:
+        die(f"no commits in range {rev_range}")
+    authored = []
+    for c in commits:
+        author = git(repo, "log", "-1", "--format=%an", c).stdout.strip()
+        authored.append((c, author))
+    if args.per_commit:
+        squashed = authored
+    else:
+        # squash consecutive commits by the same author into one round
+        squashed = []
+        for c, a in authored:
+            if squashed and squashed[-1][1] == a:
+                squashed[-1] = (c, a)  # keep the last commit of the run
+            else:
+                squashed.append((c, a))
+    revs = [base] + [c for c, _ in squashed]
+    labels = args.labels.split(",") if args.labels else [a for _, a in squashed]
+    return revs, labels, [a for _, a in squashed]
+
+
+def assign_colors(labels: list, authors: list | None, override: str | None):
+    """One colour per round; same author (or same label) shares a colour."""
+    if override:
+        names = override.split(",")
+        if len(names) < len(labels):
+            die(f"--colors gives {len(names)} colours for {len(labels)} rounds")
+        return names[: len(labels)], []
+    keys = authors if authors else labels
+    mapping: dict = {}
+    defs = []
+    colors = []
+    for k in keys:
+        if k not in mapping:
+            name, rgb = PALETTE[len(mapping) % len(PALETTE)]
+            mapping[k] = name
+            if not any(d[0] == name for d in defs):
+                defs.append((name, rgb))
+        colors.append(mapping[k])
+    return colors, defs
+
+
+# ----------------------------------------------------------------------------
+# diffing
+
+class Differ:
+    def __init__(self, workdir: Path, diff_args: list, scaffolds: list):
+        self.workdir = workdir
+        self.empty = workdir / "empty-preamble.tex"
+        self.empty.write_text("")
+        self.empty_tex = workdir / "empty-file.tex"
+        self.empty_tex.write_text("")
+        self.diff_args = list(diff_args)
+        # Scaffold macros are declared as latexdiff "text commands": their
+        # argument is diffed like prose, so an answered todo is struck through
+        # in the colour of the round that removed it instead of vanishing into
+        # a %DIFDELCMD comment.
+        if scaffolds:
+            self.diff_args.append("--append-textcmd=" + ",".join(scaffolds))
+        self.n = 0
+
+    OPAQUE_ENVS = ["picture", "DIFnomarkup", "CCSXML", "verbatim", "lstlisting",
+                   "tikzpicture", "filecontents"]
+
+    def set_opaque_envs(self, extra: list) -> None:
+        # Environments whose content latexdiff must not mark up word-by-word
+        # (raw XML, verbatim code, TikZ): treat them as opaque picture-like
+        # blocks so a changed one swaps wholesale instead of breaking TeX.
+        envs = self.OPAQUE_ENVS + (extra or [])
+        self.diff_args.append("--config=PICTUREENV=(?:" + "|".join(envs) + ")[\\w\\d*@]*")
+
+    def latexdiff(self, old: Path, new: Path) -> str:
+        cmd = ["latexdiff", "--type=UNDERLINE", "-p", str(self.empty),
+               *self.diff_args, str(old), str(new)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode:
+            die(f"latexdiff failed on {new.name}:\n{res.stderr.strip()[-2000:]}")
+        return DIF_PREAMBLE_BLOCK.sub("", res.stdout)
+
+    def tmp(self, tag: str, text: str) -> Path:
+        self.n += 1
+        p = self.workdir / f"frag-{self.n:03d}-{tag}.tex"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def blame(self, files: list, rounds: list) -> str:
+        """Markup for one file across the whole chain.
+
+        files[i] is the file at chain point i (0 = base), or None if absent.
+        files[-1] must exist. rounds[k-1] describes chain step k.
+        """
+        eff = [f if f and f.exists() else self.empty_tex for f in files]
+        changed = [
+            i for i in range(1, len(eff))
+            if not filecmp.cmp(eff[i - 1], eff[i], shallow=False)
+        ]
+        if not changed:
+            return read(eff[-1])
+        if len(changed) == 1:
+            k = changed[0]
+            return rounds[k - 1].rename(self.latexdiff(eff[0], eff[-1]))
+        # several rounds touched the file: chain the diffs newest-first, moving
+        # each stage's markup into its round's namespace so earlier stages see
+        # it as opaque tokens
+        cur = eff[-1]
+        for k in reversed(changed):
+            marked = rounds[k - 1].rename(self.latexdiff(eff[k - 1], cur))
+            cur = self.tmp(f"stage{k}", marked)
+        return read(cur)
+
+
+# ----------------------------------------------------------------------------
+# markup preamble + legend
+
+def markup_preamble(rounds: list, color_defs: list) -> str:
+    # Deletions: the text keeps the colour it inherits from context (its
+    # author's colour — or black for base text), dimmed via xcolor's
+    # current-colour dot; the strike line is drawn in the DELETER's colour
+    # through an explicitly coloured \markoverwith leader, which is the one
+    # ulem construct whose rule colour is independent of the text colour.
+    out = ["%% ---- tex-blame markup definitions ----",
+           "\\RequirePackage[normalem]{ulem}",
+           "\\makeatletter\\@ifpackageloaded{xcolor}{}{"
+           "\\RequirePackage{xcolor}}\\makeatother"]
+    for name, rgb in color_defs:
+        out.append(f"\\definecolor{{{name}}}{{rgb}}{{{rgb}}}")
+    for r in rounds:
+        p = f"\\{r.ns}TBDIF"
+        c = r.color
+        out += [
+            # robust: these appear inside section titles and other moving
+            # arguments, where an expanded ulem construct loops
+            f"\\DeclareRobustCommand{{{p}add}}[1]{{{{\\protect\\color{{{c}}}#1}}}}",
+            f"\\DeclareRobustCommand{{{p}del}}[1]{{{{"
+            f"\\bgroup\\markoverwith{{\\textcolor{{{c}}}"
+            f"{{\\rule[0.5ex]{{2pt}}{{0.4pt}}}}}}"
+            f"\\ULon{{{{\\protect\\color{{.!65}}#1}}}}}}}}",
+            f"\\providecommand{{{p}addbegin}}{{}} \\providecommand{{{p}addend}}{{}}",
+            f"\\providecommand{{{p}delbegin}}{{}} \\providecommand{{{p}delend}}{{}}",
+            f"\\providecommand{{{p}addFL}}[1]{{{p}add{{#1}}}}"
+            f" \\providecommand{{{p}delFL}}[1]{{{p}del{{#1}}}}",
+            f"\\providecommand{{{p}addbeginFL}}{{}} \\providecommand{{{p}addendFL}}{{}}",
+            f"\\providecommand{{{p}delbeginFL}}{{}} \\providecommand{{{p}delendFL}}{{}}",
+        ]
+    out.append("%% ---- end tex-blame definitions ----")
+    return "\n".join(out) + "\n"
+
+
+def legend(rounds: list, base_label: str) -> str:
+    seen = []
+    for r in rounds:
+        if (r.label, r.color) not in seen:
+            seen.append((r.label, r.color))
+    parts = [f"black = {base_label}"]
+    parts += [f"{{\\color{{{c}}}{l}}}" for l, c in seen]
+    joined = " \\textbullet\\ ".join(parts)
+    return ("\n\\noindent\\fbox{\\parbox{\\linewidth}{\\textbf{tex-blame:} "
+            + joined
+            + " \\textbullet\\ struck-through = deleted (the dimmed text keeps "
+              "its author's colour; the strike line is the deleter's colour).}}\\medskip\n")
+
+
+# ----------------------------------------------------------------------------
+# input graph, flattening
+
+def collect_inputs(main: Path, src_dir: Path):
+    """(preamble_inputs, body_inputs) reachable from the root, as names."""
+    text = read(main)
+    m = BEGIN_DOC.search(text)
+    split = m.start() if m else 0
+    pre_names, body_names = [], []
+    for match in re.finditer(r"^\s*\\(?:input|include)\{([^}]+)\}", text, re.M):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        if text[line_start:].lstrip().startswith("%"):
+            continue
+        (pre_names if match.start() < split else body_names).append(match.group(1))
+
+    def walk(names, acc):
+        for name in names:
+            if name in acc:
+                continue
+            acc.append(name)
+            child = src_dir / resolve_name(name)
+            if child.exists():
+                nested = [
+                    mm.group(1)
+                    for mm in re.finditer(
+                        r"^\s*\\(?:input|include)\{([^}]+)\}", read(child), re.M)
+                ]
+                walk(nested, acc)
+
+    pre_acc, body_acc = [], []
+    walk(pre_names, pre_acc)
+    walk(body_names, body_acc)
+    return pre_acc, body_acc
+
+
+def flatten(main: Path, src_dir: Path, seen=None) -> str:
+    seen = seen or set()
+    if main in seen:
+        die(f"circular \\input involving {main}")
+    seen.add(main)
+    out = []
+    for line in read(main).splitlines():
+        m = INPUT_LINE.match(line)
+        if m and not line.lstrip().startswith("%"):
+            child = src_dir / resolve_name(m.group(2))
+            out.append(flatten(child, src_dir, seen) if child.exists() else line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def split_root(text: str):
+    b = BEGIN_DOC.search(text)
+    e = END_DOC.search(text)
+    if not b or not e:
+        die("main file has no \\begin{document}/\\end{document}")
+    return text[: b.end()], text[b.end(): e.start()], text[e.start():]
+
+
+# ----------------------------------------------------------------------------
+# main
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="tex-blame",
+        description="git blame for LaTeX: compile a PDF where each round/author "
+                    "of edits appears in its own colour.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--git", nargs="+", metavar="REV",
+                      help="explicit chain: BASE R1 [R2 ...] (BASE shown black)")
+    mode.add_argument("--since", metavar="BASE",
+                      help="blame every commit after BASE (before it: black)")
+    mode.add_argument("--all", action="store_true",
+                      help="blame the whole history (base = empty tree)")
+    mode.add_argument("--dirs", nargs="+", metavar="DIR",
+                      help="explicit chain of directories: D0 D1 [D2 ...]")
+    ap.add_argument("--head", default="HEAD",
+                    help="newest revision for --since/--all")
+    ap.add_argument("--repo", default=".", help="git repository root")
+    ap.add_argument("--main", required=True,
+                    help="main .tex file, relative to the project root")
+    ap.add_argument("--labels", default=None,
+                    help="comma-separated legend labels, one per round "
+                         "(default: author names in --since/--all, round N in --git)")
+    ap.add_argument("--colors", default=None,
+                    help="comma-separated colour names, one per round "
+                         "(default: built-in palette, one colour per author)")
+    ap.add_argument("--base-label", default=None,
+                    help="legend label for black text (default: base revision name)")
+    ap.add_argument("--per-commit", action="store_true",
+                    help="one round per commit (default squashes consecutive "
+                         "commits by the same author)")
+    ap.add_argument("--scaffold", action="append", default=None, metavar="CMD",
+                    help="macro whose argument is scaffold text (todo notes, "
+                         "decision markers): an answered one is struck through "
+                         "in the answerer's colour. Repeatable; default: todo, decide.")
+    ap.add_argument("--no-scaffold", action="store_true",
+                    help="disable scaffold handling")
+    ap.add_argument("--opaque-env", action="append", default=[], metavar="ENV",
+                    help="additional environment to treat as an opaque block "
+                         "(not marked up word-by-word); CCSXML, verbatim, "
+                         "lstlisting, tikzpicture, filecontents are built in")
+    ap.add_argument("--no-legend", action="store_true", help="skip the legend box")
+    ap.add_argument("--no-pdf", action="store_true",
+                    help="stop after writing the merged .tex")
+    ap.add_argument("--open", action="store_true", help="open the PDF (macOS)")
+    ap.add_argument("--keep", action="store_true", help="keep the work directory")
+    ap.add_argument("--latexdiff-arg", action="append", default=[], metavar="ARG",
+                    help="extra argument for every latexdiff call (repeatable)")
+    ap.add_argument("-o", "--output", default=None,
+                    help="output PDF path (default: <main>-blame.pdf in the cwd)")
+    args = ap.parse_args()
+
+    for tool in ("latexdiff", "latexmk"):
+        if not shutil.which(tool):
+            die(f"'{tool}' not found on PATH")
+
+    workdir = Path(tempfile.mkdtemp(prefix="tex-blame-"))
+    try:
+        # -- build the chain -----------------------------------------------
+        authors = None
+        if args.dirs:
+            if len(args.dirs) < 2:
+                die("--dirs needs a base directory and at least one later one")
+            source = DirSource(args.dirs)
+            n_rounds = len(args.dirs) - 1
+            labels = (args.labels.split(",") if args.labels
+                      else [f"round {i}" for i in range(1, n_rounds + 1)])
+            base_label = args.base_label or "base"
+        else:
+            repo = Path(args.repo).resolve()
+            revs, labels, authors = build_git_chain(args, repo)
+            n_rounds = len(revs) - 1
+            source = GitSource(repo, revs, workdir)
+            base_label = args.base_label or (
+                f"before {revs[0]}" if revs[0] else "(nothing: full history blamed)")
+        if len(labels) != n_rounds:
+            die(f"--labels gives {len(labels)} labels for {n_rounds} rounds")
+        if n_rounds > len(NS_LETTERS):
+            die(f"{n_rounds} rounds exceeds the maximum of {len(NS_LETTERS)}; "
+                "use --since or drop --per-commit to squash")
+
+        colors, color_defs = assign_colors(labels, authors, args.colors)
+        rounds = [Round(i + 1, labels[i], colors[i]) for i in range(n_rounds)]
+        shown = ", ".join(f"{r.label}={r.color}" for r in rounds)
+        info(f"{n_rounds} round(s): {shown}")
+
+        scaffolds = [] if args.no_scaffold else (args.scaffold or ["todo", "decide"])
+        differ = Differ(workdir, args.latexdiff_arg, scaffolds)
+        differ.set_opaque_envs(args.opaque_env)
+
+        # -- newest tree (compile home) ------------------------------------
+        final_tree = workdir / "final"
+        source.extract_final(final_tree)
+        main_rel = Path(args.main)
+        if not (final_tree / main_rel).exists():
+            die(f"main file {main_rel} not found in the newest revision")
+        src_final = (final_tree / main_rel).parent
+        main_dir_rel = PurePosixPath(main_rel.parent.as_posix())
+
+        def chain_files(rel: PurePosixPath):
+            files = [source.file_at(i, rel) for i in range(n_rounds)]
+            files.append(final_tree / Path(rel))
+            return files
+
+        # -- stitch every file with the right attribution ------------------
+        pre_inputs, body_inputs = collect_inputs(final_tree / main_rel, src_final)
+        stitched = workdir / "stitched"
+        stitched.mkdir()
+
+        for name in pre_inputs:
+            child = src_final / resolve_name(name)
+            if child.exists():
+                dest = stitched / child.relative_to(src_final)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, dest)
+                info(f"preamble file taken from the newest revision: {child.name}")
+
+        for name in body_inputs:
+            b_file = src_final / resolve_name(name)
+            if not b_file.exists():
+                continue
+            rel = b_file.relative_to(src_final)
+            dest = stitched / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(
+                differ.blame(chain_files(main_dir_rel / rel.as_posix()), rounds),
+                encoding="utf-8",
+            )
+
+        # -- root: preamble from the newest revision, body blamed ----------
+        main_posix = PurePosixPath(main_rel.as_posix())
+
+        def root_body(i: int):
+            f = (source.file_at(i, main_posix) if i < n_rounds
+                 else final_tree / main_rel)
+            if not f or not f.exists():
+                return None
+            _, body, _ = split_root(read(f))
+            return differ.tmp(f"rootbody{i}", body)
+
+        pre_final, _, tail_final = split_root(read(final_tree / main_rel))
+        body_markup = differ.blame(
+            [root_body(i) for i in range(n_rounds + 1)], rounds)
+        root = pre_final.replace(
+            "\\begin{document}",
+            markup_preamble(rounds, color_defs) + "\n\\begin{document}", 1)
+        if not args.no_legend:
+            leg = legend(rounds, base_label)
+            if "\\maketitle" in body_markup:
+                body_markup = body_markup.replace("\\maketitle",
+                                                  "\\maketitle\n" + leg, 1)
+            else:
+                body_markup = leg + body_markup
+        root_out = stitched / main_rel.name
+        root_out.write_text(root + body_markup + tail_final, encoding="utf-8")
+
+        # -- flatten and compile -------------------------------------------
+        merged = flatten(root_out, stitched)
+        out_stem = main_rel.stem + "-blame"
+        merged_tex = src_final / (out_stem + ".tex")
+        merged_tex.write_text(merged, encoding="utf-8")
+
+        if args.no_pdf:
+            final_tex = Path.cwd() / (out_stem + ".tex")
+            shutil.copy2(merged_tex, final_tex)
+            info(f"wrote {final_tex}")
+            return
+
+        info("compiling with latexmk ...")
+        res = subprocess.run(
+            ["latexmk", "-pdf", "-interaction=nonstopmode", "-halt-on-error",
+             merged_tex.name],
+            cwd=src_final, capture_output=True, text=True)
+        pdf = src_final / (out_stem + ".pdf")
+        if res.returncode or not pdf.exists():
+            log = src_final / (out_stem + ".log")
+            excerpt = ""
+            if log.exists():
+                lines = read(log).splitlines()
+                marks = [i for i, l in enumerate(lines) if l.startswith("!")]
+                if marks:
+                    excerpt = "\n".join(lines[marks[0]: marks[0] + 6])
+            keep_note = "" if args.keep else " (rerun with --keep to inspect)"
+            die(f"latexmk failed.{keep_note}\n{excerpt}\nfull log: {log}")
+
+        out_pdf = Path(args.output) if args.output else Path.cwd() / (out_stem + ".pdf")
+        shutil.copy2(pdf, out_pdf)
+        info(f"wrote {out_pdf}")
+        if args.open and sys.platform == "darwin":
+            subprocess.run(["open", str(out_pdf)])
+    finally:
+        if args.keep:
+            info(f"work directory kept at {workdir}")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,86 +1,90 @@
-# latexdiff3
+# tex-blame
 
-Three-way `latexdiff` for multi-author rounds. Given three revisions of a LaTeX project — `BASE → A → B`, where B builds on A — it compiles a single PDF in which:
+`git blame` for LaTeX papers, rendered as a compiled PDF.
 
-- text present in **BASE** stays **black**,
-- text added in round **A** is set in one colour (default `Teal`),
-- text added in round **B** is set in a second colour (default `RoyalBlue`),
-- deletions are struck through in the colour of the round that removed them.
+Point it at a paper's git history and it compiles one PDF in which every author's contributions appear in their own colour — base text black, additions coloured by author, deletions struck through in the colour of whoever removed them, and answered TODO scaffolds struck through by their answerer instead of silently vanishing.
 
-The typical use: a co-author pushed a round of edits (A), you wrote your own round on top (B), and you want one document that shows who contributed what relative to the last common state — instead of two separate two-way diffs.
+Built on [`latexdiff`](https://github.com/ftilmann/latexdiff), which does all the actual diffing; `tex-blame` orchestrates it across a chain of revisions, keeps the attribution honest, and gets the result through `latexmk` in one go.
+
+## Modes
+
+```sh
+# blame everything after a given commit (before it: black)
+tex-blame --since BASE_SHA --main docs/src/manuscript.tex
+
+# blame the entire history — base is the empty tree, every word gets an author
+tex-blame --all --main docs/src/manuscript.tex
+
+# explicit chain of revisions (first one shown black)
+tex-blame --git BASE REV1 REV2 --main manuscript.tex --labels alice,bob
+
+# no git at all: a chain of directories
+tex-blame --dirs old/ theirs/ mine/ --main manuscript.tex
+```
+
+In `--since`/`--all` mode the first-parent commit chain is walked, consecutive commits by the same author are squashed into one round (`--per-commit` to keep them separate), and each author is assigned a colour from a built-in palette. A legend box is injected after `\maketitle`.
 
 ## Requirements
 
 - `latexdiff` (tested with 1.4.0)
 - `latexmk` + a TeX distribution
-- Python 3.8+
-- `git` (for `--git` mode)
-- colour names are `xcolor` names; the document (or its class) must load `xcolor`
+- Python 3.8+, `git` for the git modes
 
-## Install
-
-Put the `latexdiff3` script somewhere on your `PATH`:
+No Python dependencies; `tex-blame` is a single file. Put it on your `PATH`:
 
 ```sh
-ln -s "$(pwd)/latexdiff3" ~/.local/bin/latexdiff3
+ln -s "$(pwd)/tex-blame" ~/.local/bin/tex-blame
 ```
 
-## Usage
-
-Diff three git revisions of a paper (run anywhere, point `--repo` at the checkout):
-
-```sh
-latexdiff3 --git BASE_SHA A_SHA B_SHA \
-  --repo ~/github/my-paper --main docs/src/manuscript.tex \
-  --label1 "co-author" --label2 "me" \
-  -o threeway.pdf --open
-```
-
-Or three plain directories, each containing the full project tree:
-
-```sh
-latexdiff3 --dirs old/ theirs/ mine/ --main manuscript.tex
-```
-
-Options:
+## Options
 
 | flag | meaning |
 |---|---|
-| `--git BASE A B` / `--dirs BASE A B` | the three revisions (git SHAs/refs, or directories) |
-| `--repo PATH` | git repository root for `--git` (default `.`) |
+| `--since BASE` | blame every commit after `BASE`; earlier text stays black |
+| `--all` | blame the whole history (base = empty tree) |
+| `--git BASE R1 [R2 ...]` | explicit revision chain; `BASE` shown black |
+| `--dirs D0 D1 [D2 ...]` | explicit directory chain |
+| `--head REF` | newest revision for `--since`/`--all` (default `HEAD`) |
+| `--repo PATH` | git repository root (default `.`) |
 | `--main PATH` | main `.tex` file, relative to the project root (required) |
-| `--label1/--label2` | legend labels for the two rounds |
-| `--color1/--color2` | `xcolor` colour names (default `Teal` / `RoyalBlue`) |
-| `--scaffold CMD` | scaffold macro handled specially (repeatable; default `todo`, `decide`) |
+| `--labels a,b,...` | legend labels, one per round (default: author names) |
+| `--colors x,y,...` | colour names, one per round (default: built-in palette per author) |
+| `--base-label TEXT` | legend label for black text |
+| `--per-commit` | one round per commit instead of squashing author runs |
+| `--scaffold CMD` | scaffold macro (repeatable; default `todo`, `decide`) |
 | `--no-scaffold` | disable scaffold handling |
-| `--no-legend` | skip the legend box injected after `\maketitle` |
-| `--no-pdf` | write the merged `.tex` next to you and stop |
+| `--opaque-env ENV` | extra environment to treat as an opaque block (repeatable) |
+| `--no-legend` | skip the legend box |
+| `--no-pdf` | write the merged `.tex` and stop |
 | `--open` | open the PDF when done (macOS) |
-| `--keep` | keep the temporary work directory (debugging) |
-| `--latexdiff-arg ARG` | pass an extra argument to every underlying `latexdiff` call |
-| `-o PATH` | output PDF path (default `<main>-diff3.pdf` in the cwd) |
+| `--keep` | keep the temporary work directory |
+| `--latexdiff-arg ARG` | pass an extra argument to every `latexdiff` call |
+| `-o PATH` | output PDF path (default `<main>-blame.pdf`) |
 
 ## Scaffold macros: seeing who answered a TODO
 
-Papers often carry scaffold markers — `\todo{...}`, `\decide{...}` — that a later round *answers* by deleting the marker and writing real prose. Plain `latexdiff` hides a deleted macro call inside an invisible `%DIFDELCMD` comment, so the answered todo silently disappears from the diff.
+Papers often carry scaffold markers — `\todo{...}`, `\decide{...}` — that a later round *answers* by deleting the marker and writing real prose. Plain `latexdiff` hides a deleted macro call inside an invisible `%DIFDELCMD` comment, so answered todos silently disappear from a diff.
 
-`latexdiff3` declares scaffold macros as latexdiff *text commands*: their argument is diffed like prose, so an answered todo stays visible, **struck through in the colour of the round that answered it**, right next to the prose that replaced it. Edits *within* a todo diff word-by-word the same way.
-
-Add your own markers with `--scaffold mynote --scaffold draft` (this replaces the default list; include `todo`/`decide` if you still want them). Scaffold macros must take a single-paragraph argument.
+`tex-blame` declares scaffold macros as latexdiff *text commands*: their argument is diffed like prose, so an answered todo stays visible, struck through in the colour of the round that answered it, right next to the prose that replaced it. Edits *within* a todo diff word-by-word the same way. Scaffold macros must take a single-paragraph argument.
 
 ## How it works
 
-1. The three trees are extracted and the `\input`/`\include` graph is walked from the main file.
-2. **Per-file attribution.** A file changed in only one round gets a plain two-way diff (BASE vs B) attributed wholly to that round — chained diffs are avoided wherever possible because they are what produces artefacts.
-3. A file changed in **both** rounds gets a two-stage diff: A vs B is diffed first and its markup renamed into a private namespace (`\ADIFadd`/`\ADIFdel`), then BASE is diffed against that marked file, producing the outer `\DIFadd`/`\DIFdel` markup for round A. The rename keeps the two rounds' markup from colliding, and the B-round spans are treated as opaque tokens in the second pass so attribution doesn't leak.
-4. Files `\input` in the **preamble** are taken verbatim from B (markup cannot render before `\begin{document}`). The root file's preamble likewise comes from B; only its body is diffed.
-5. Everything is flattened into one `.tex`, colour definitions and a legend are injected, and `latexmk` compiles it inside a copy of B's tree so the bibliography, figures, and document class resolve normally.
+1. The revision chain is built (explicitly, or from the first-parent git history) and the `\input`/`\include` graph is walked from the main file of the newest revision.
+2. **Per-file attribution.** A file changed by only one round gets a plain two-way diff (base vs newest) attributed wholly to that round — chained diffs are avoided wherever possible, because chaining is what produces artefacts.
+3. A file changed by **several** rounds gets a chained diff, newest round first: each stage's `latexdiff` markup is immediately renamed into that round's private macro namespace (`\ATBDIFadd`, `\BTBDIFadd`, ...), so earlier stages see it as opaque tokens and attribution cannot leak between rounds.
+4. Files `\input` in the **preamble** are taken verbatim from the newest revision (markup cannot render before `\begin{document}`); the root file's preamble likewise, with only its body diffed.
+5. Raw-content environments (`CCSXML`, `verbatim`, `lstlisting`, `tikzpicture`, `filecontents`) are treated as opaque blocks that swap wholesale rather than being marked up word-by-word.
+6. Everything is flattened into one `.tex`, per-round colour definitions and a legend are injected, and `latexmk` compiles it inside a copy of the newest tree so the bibliography, figures, and document class resolve normally.
 
 ## Limitations
 
-- Assumes a linear history: B must contain A's changes (e.g. A merged/cherry-picked before B was written). If A and B are divergent siblings, merge first and use the merged state as B.
-- In files both rounds touched, a passage that **both** rounds rewrote can render noisily (the same original text struck once per round). Attribution of the surviving text stays correct.
-- `verbatim`/`listings` content is not supported (latexdiff's verbatim preamble extensions are stripped to avoid duplicate-definition clashes).
-- The bibliography compiles from B's `.bib`; `.bib` changes are not marked up.
+- The chain must be linear: each revision must contain the previous one's changes. For git histories the first-parent path is used; content merged in via PRs is attributed to the round that brought it onto the first-parent line.
+- A passage rewritten by **several** rounds can render noisily (the same original text struck once per round). Attribution of the surviving text stays correct.
+- The bibliography compiles from the newest `.bib`; `.bib` changes are not marked up.
 - The root file must contain `\begin{document}` and `\end{document}` directly (not via `\input`).
-- An `\input` line added or removed between revisions may end up wrapped in markup that prevents flattening from inlining it; the compile will then pull the file from B's tree unmarked.
+- At most 26 rounds (one markup namespace letter per round); author squashing keeps real histories well under this.
+- An `\input` line added or removed between revisions may end up wrapped in markup that prevents inlining; the compile then pulls that file from the newest tree unmarked.
+
+## License
+
+GPL-3.0-or-later. If you distribute a modified version, the GPL requires you to make its source available under the same terms.
