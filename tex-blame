@@ -371,7 +371,16 @@ class Differ:
 # ----------------------------------------------------------------------------
 # markup preamble + legend
 
-def markup_preamble(rounds: list, color_defs: list) -> str:
+TEX_SPECIALS = {"#": "\\#", "$": "\\$", "%": "\\%", "&": "\\&", "_": "\\_",
+                "{": "\\{", "}": "\\}", "~": "\\textasciitilde{}",
+                "^": "\\textasciicircum{}", "\\": "\\textbackslash{}"}
+
+
+def tex_escape(s: str) -> str:
+    return "".join(TEX_SPECIALS.get(ch, ch) for ch in s)
+
+
+def markup_preamble(rounds: list, color_defs: list, tags: bool = True) -> str:
     # Deletions: the text keeps the colour it inherits from context (its
     # author's colour — or black for base text), dimmed via xcolor's
     # current-colour dot; the strike line is drawn in the DELETER's colour
@@ -383,6 +392,14 @@ def markup_preamble(rounds: list, color_defs: list) -> str:
            "\\RequirePackage{xcolor}}\\makeatother"]
     for name, rgb in color_defs:
         out.append(f"\\definecolor{{{name}}}{{rgb}}{{{rgb}}}")
+    if tags:
+        # tag once per author-run per paragraph: the para/begin hook resets
+        # the tracker so every paragraph names its contributors afresh
+        out.append("\\gdef\\tbBlameLast{0}")
+        out.append("\\AddToHook{para/begin}{\\gdef\\tbBlameLast{0}}")
+        tag_ids = {}
+        for r in rounds:
+            tag_ids.setdefault(r.label, len(tag_ids) + 1)
     for r in rounds:
         p = f"\\{r.ns}TBDIF"
         c = r.color
@@ -397,8 +414,29 @@ def markup_preamble(rounds: list, color_defs: list) -> str:
             # colour-only wrapper used inside deletion spans: dimmed AUTHOR
             # colour for text this round wrote that a later round deleted
             f"\\DeclareRobustCommand{{{p}txt}}[1]{{{{\\protect\\color{{{c}!65}}#1}}}}",
-            f"\\providecommand{{{p}addbegin}}{{}} \\providecommand{{{p}addend}}{{}}",
-            f"\\providecommand{{{p}delbegin}}{{}} \\providecommand{{{p}delend}}{{}}",
+        ]
+        if tags:
+            # a change-region begin marker becomes a tiny subscripted author
+            # name in the round's colour; \mbox keeps it legal in math mode.
+            # \tbBlameLast tracks the last printed tag so runs of regions by
+            # the same author are tagged once, not per latexdiff chunk.
+            tag_id = tag_ids[r.label]
+            tag = (f"\\ifnum\\tbBlameLast={tag_id}\\relax\\else"
+                   f"\\protect\\mbox{{\\textsubscript"
+                   f"{{\\tiny\\protect\\color{{{c}}}{tex_escape(r.label)}}}}}"
+                   f"\\gdef\\tbBlameLast{{{tag_id}}}\\fi")
+            out += [
+                f"\\DeclareRobustCommand{{{p}addbegin}}{{{tag}}}"
+                f" \\providecommand{{{p}addend}}{{}}",
+                f"\\DeclareRobustCommand{{{p}delbegin}}{{{tag}}}"
+                f" \\providecommand{{{p}delend}}{{}}",
+            ]
+        else:
+            out += [
+                f"\\providecommand{{{p}addbegin}}{{}} \\providecommand{{{p}addend}}{{}}",
+                f"\\providecommand{{{p}delbegin}}{{}} \\providecommand{{{p}delend}}{{}}",
+            ]
+        out += [
             f"\\providecommand{{{p}addFL}}[1]{{{p}add{{#1}}}}"
             f" \\providecommand{{{p}delFL}}[1]{{{p}del{{#1}}}}",
             f"\\providecommand{{{p}addbeginFL}}{{}} \\providecommand{{{p}addendFL}}{{}}",
@@ -534,6 +572,9 @@ def main() -> None:
                     help="additional environment to treat as an opaque block "
                          "(not marked up word-by-word); CCSXML, verbatim, "
                          "lstlisting, tikzpicture, filecontents are built in")
+    ap.add_argument("--no-tags", action="store_true",
+                    help="omit the tiny subscripted author-name tag at the "
+                         "start of each change region")
     ap.add_argument("--no-legend", action="store_true", help="skip the legend box")
     ap.add_argument("--no-pdf", action="store_true",
                     help="stop after writing the merged .tex")
@@ -638,7 +679,7 @@ def main() -> None:
             [root_body(i) for i in range(n_rounds + 1)], rounds)
         root = pre_final.replace(
             "\\begin{document}",
-            markup_preamble(rounds, color_defs) + "\n\\begin{document}", 1)
+            markup_preamble(rounds, color_defs, tags=not args.no_tags) + "\n\\begin{document}", 1)
         if not args.no_legend:
             leg = legend(rounds, base_label)
             if "\\maketitle" in body_markup:

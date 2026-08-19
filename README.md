@@ -54,6 +54,7 @@ ln -s "$(pwd)/tex-blame" ~/.local/bin/tex-blame
 | `--scaffold CMD` | scaffold macro (repeatable; default `todo`, `decide`) |
 | `--no-scaffold` | disable scaffold handling |
 | `--opaque-env ENV` | extra environment to treat as an opaque block (repeatable) |
+| `--no-tags` | omit the tiny subscripted author-name tag at the start of each change region (tags print once per author-run per paragraph) |
 | `--no-legend` | skip the legend box |
 | `--no-pdf` | write the merged `.tex` and stop |
 | `--open` | open the PDF when done (macOS) |
