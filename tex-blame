@@ -81,12 +81,14 @@ END_DOC = re.compile(r"\\end\{document\}")
 
 # default palette: our own colour definitions (rgb), independent of xcolor's
 # dvipsnames option so any document that loads color/xcolor can render them
+# ordered for maximum pairwise separability (blue/orange first: the classic
+# colour-blind-safe pair)
 PALETTE = [
-    ("texblameTeal", "0.00,0.45,0.45"),
-    ("texblameBlue", "0.20,0.35,0.80"),
-    ("texblameBrick", "0.70,0.15,0.15"),
-    ("texblameOrange", "0.80,0.40,0.00"),
+    ("texblameBlue", "0.15,0.35,0.85"),
+    ("texblameOrange", "0.85,0.42,0.00"),
     ("texblameViolet", "0.55,0.20,0.70"),
+    ("texblameTeal", "0.00,0.45,0.45"),
+    ("texblameBrick", "0.70,0.15,0.15"),
     ("texblameOlive", "0.40,0.50,0.10"),
     ("texblameMagenta", "0.80,0.00,0.60"),
     ("texblameBrown", "0.50,0.35,0.20"),
